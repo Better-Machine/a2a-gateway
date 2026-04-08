@@ -196,6 +196,37 @@
           }
         }
       },
+      "federation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "gatewayId": { "type": "string" },
+          "peers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "gatewayId": { "type": "string" },
+                "inboxUrl": { "type": "string" },
+                "hmacSecret": { "type": "string" }
+              },
+              "required": ["gatewayId", "inboxUrl", "hmacSecret"]
+            }
+          },
+          "limits": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxHops": { "type": "number", "default": 5, "minimum": 1 },
+              "maxPayloadBytes": { "type": "number", "default": 2097152, "minimum": 1024 }
+            }
+          },
+          "defaultAgentId": { "type": "string", "default": "main" },
+          "timestampSkewSeconds": { "type": "number", "default": 300, "minimum": 1 }
+        }
+      },
       "resilience": {
         "type": "object",
         "additionalProperties": false,
@@ -241,6 +272,13 @@
     "security": {
       "token": { "sensitive": true },
       "tokens": { "items": { "sensitive": true } }
+    },
+    "federation": {
+      "peers": {
+        "items": {
+          "hmacSecret": { "sensitive": true }
+        }
+      }
     }
   }
 }

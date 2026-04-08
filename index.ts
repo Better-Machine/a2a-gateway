@@ -37,6 +37,9 @@ import {
   validateUri,
   validateMimeType,
 } from "./src/file-security.js";
+import { FederationGateway } from "./src/internal/federation.js";
+import type { FederationConfig } from "./src/internal/federation.js";
+import { GatewayRpcDispatcher } from "./src/internal/gateway-dispatcher.js";
 
 /** Build a JSON-RPC error response. */
 function jsonRpcError(id: string | number | null, code: number, message: string) {
@@ -149,6 +152,7 @@ export function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => st
   const limits = asObject(config.limits);
   const observability = asObject(config.observability);
   const timeouts = asObject(config.timeouts);
+  const federation = asObject(config.federation);
   const resilience = asObject(config.resilience);
   const healthCheck = asObject(resilience.healthCheck);
   const retry = asObject(resilience.retry);
@@ -239,6 +243,29 @@ export function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => st
         resetTimeoutMs: asNumber(circuitBreaker.resetTimeoutMs, 30_000),
       },
     },
+    federation: federation ? {
+      enabled: asBoolean(federation.enabled, false),
+      gatewayId: asString(federation.gatewayId, ""),
+      peers: Array.isArray(federation.peers)
+        ? (federation.peers as unknown[]).filter((p): p is Record<string, unknown> => {
+            const obj = asObject(p);
+            return !!obj && typeof obj.gatewayId === "string" && typeof obj.inboxUrl === "string" && typeof obj.hmacSecret === "string";
+          }).map((p) => ({
+            gatewayId: asString((p as Record<string, unknown>).gatewayId, ""),
+            inboxUrl: asString((p as Record<string, unknown>).inboxUrl, ""),
+            hmacSecret: asString((p as Record<string, unknown>).hmacSecret, ""),
+          }))
+        : [],
+      limits: (() => {
+        const fedLimits = asObject(federation.limits);
+        return {
+          maxHops: asNumber(fedLimits?.maxHops, 5),
+          maxPayloadBytes: asNumber(fedLimits?.maxPayloadBytes, 2_097_152),
+        };
+      })(),
+      defaultAgentId: asString(federation.defaultAgentId, "main"),
+      timestampSkewSeconds: asNumber(federation.timestampSkewSeconds, 300),
+    } : undefined,
   };
 }
 
@@ -402,6 +429,35 @@ const plugin = {
       );
     }
 
+    // ------------------------------------------------------------------
+    // Federation layer
+    // ------------------------------------------------------------------
+    let federationGateway: FederationGateway | null = null;
+    if (config.federation?.enabled && config.federation.peers && config.federation.peers.length > 0) {
+      const fedConfig: FederationConfig = {
+        gatewayId: config.federation.gatewayId || `gateway-${config.server.port}`,
+        peers: config.federation.peers,
+        limits: {
+          maxHops: config.federation.limits?.maxHops ?? 5,
+          maxPayloadBytes: config.federation.limits?.maxPayloadBytes ?? 2_097_152,
+        },
+        defaultAgentId: config.federation.defaultAgentId || "main",
+        timestampSkewSeconds: config.federation.timestampSkewSeconds ?? 300,
+      };
+
+      const fedDispatcher = GatewayRpcDispatcher.createFromPluginApi(api);
+      federationGateway = new FederationGateway(fedConfig, fedDispatcher);
+
+      // Mount federation inbox on express app (must be before app.listen)
+      // Use express.json() for the federation inbox route
+      app.use("/a2a/v1/inbox", express.json());
+      federationGateway.start(app);
+
+      api.logger.info(
+        `a2a-gateway: federation enabled — gatewayId=${fedConfig.gatewayId} peers=${fedConfig.peers.length}`,
+      );
+    }
+
     let server: Server | null = null;
     let grpcServer: GrpcServer | null = null;
     let cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -412,6 +468,30 @@ const plugin = {
         metrics: telemetry.snapshot(),
       });
     });
+
+    if (federationGateway) {
+      api.registerGatewayMethod("a2a.federation.send", ({ params, respond }) => {
+        const payload = asObject(params);
+        const destGatewayId = asString(payload.destGatewayId, "");
+        const destAgentId = asString(payload.destAgentId, "") || undefined;
+        const message = asString(payload.message, "");
+        const correlationId = asString(payload.correlationId, "") || undefined;
+
+        if (!destGatewayId || !message) {
+          respond(false, { error: "destGatewayId and message are required" });
+          return;
+        }
+
+        const result = federationGateway!.sendToGateway(destGatewayId, destAgentId, message, {
+          correlationId,
+        });
+        respond(result.ok, result);
+      });
+
+      api.registerGatewayMethod("a2a.federation.metrics", ({ respond }) => {
+        respond(true, federationGateway!.getMetrics());
+      });
+    }
 
     api.registerGatewayMethod("a2a.audit", ({ params, respond }) => {
       const payload = asObject(params);
@@ -564,6 +644,185 @@ const plugin = {
       });
     }
 
+    // ------------------------------------------------------------------
+    // Agent tool: a2a_send
+    // Lets the agent send a text message (and optional JSON data) to a
+    // named peer via A2A message/send — no curl required.
+    // ------------------------------------------------------------------
+    if (api.registerTool) {
+      const sendParams = {
+        type: "object" as const,
+        required: ["peer", "message"],
+        properties: {
+          peer: {
+            type: "string" as const,
+            description: "Name of the target peer (must match a configured peer name)",
+          },
+          message: {
+            type: "string" as const,
+            description: "Text message to send to the peer agent",
+          },
+          agentId: {
+            type: "string" as const,
+            description:
+              "Route to a specific agentId on the peer (OpenClaw extension). Omit to use the peer's default agent.",
+          },
+          data: {
+            type: "object" as const,
+            description:
+              "Optional structured JSON payload to include as an A2A DataPart alongside the text message.",
+            additionalProperties: true,
+            properties: {},
+          },
+        },
+      };
+
+      api.registerTool({
+        name: "a2a_send",
+        description:
+          "Send a text message to a peer agent via A2A (message/send). " +
+          "Supports optional structured JSON data as a DataPart. " +
+          "Use this to communicate with Woodhouse, Ray, or any other configured A2A peer without curl.",
+        label: "A2A Send Message",
+        parameters: sendParams,
+        async execute(_toolCallId, params) {
+          const peer = config.peers.find((p) => p.name === params.peer);
+          if (!peer) {
+            const available =
+              config.peers.map((p) => p.name).join(", ") || "(none configured)";
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Peer not found: "${params.peer}". Available peers: ${available}`,
+                },
+              ],
+              details: { ok: false },
+            };
+          }
+
+          const parts: Array<Record<string, unknown>> = [
+            { kind: "text", text: params.message },
+          ];
+
+          if (params.data && typeof params.data === "object") {
+            parts.push({
+              kind: "data",
+              data: params.data,
+              mimeType: "application/json",
+            });
+          }
+
+          const outboundMessage: Record<string, unknown> = { parts };
+          if (params.agentId) {
+            outboundMessage.agentId = params.agentId;
+          }
+
+          try {
+            const startedAt = Date.now();
+            const result = await client.sendMessage(peer, outboundMessage, {
+              healthManager: healthManager ?? undefined,
+              retryConfig: config.resilience.retry,
+              log: (level, msg, details) => {
+                if (details?.attempt) {
+                  telemetry.recordPeerRetry(peer.name, details.attempt as number);
+                }
+                api.logger[level](details ? `${msg}: ${JSON.stringify(details)}` : msg);
+              },
+            });
+
+            const duration = Date.now() - startedAt;
+            telemetry.recordOutboundRequest(peer.name, result.ok, result.statusCode, duration);
+            auditLogger.recordOutbound(peer.name, result.ok, result.statusCode, duration);
+
+            if (result.ok) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `Message sent to ${params.peer} via A2A.\n` +
+                      `Response: ${JSON.stringify(result.response)}`,
+                  },
+                ],
+                details: { ok: true, response: result.response },
+              };
+            }
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Failed to send message to ${params.peer}: ${JSON.stringify(result.response)}`,
+                },
+              ],
+              details: { ok: false, response: result.response },
+            };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Error sending message to ${params.peer}: ${msg}`,
+                },
+              ],
+              details: { ok: false, error: msg },
+            };
+          }
+        },
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Agent tool: a2a_peers
+    // Lists configured peers with live health and circuit-breaker status.
+    // ------------------------------------------------------------------
+    if (api.registerTool) {
+      api.registerTool({
+        name: "a2a_peers",
+        description:
+          "List all configured A2A peers with their endpoint URLs and live health/circuit-breaker status. " +
+          "Use this to see which agents are available before sending a message.",
+        label: "A2A List Peers",
+        parameters: {
+          type: "object" as const,
+          required: [],
+          properties: {},
+        },
+        async execute(_toolCallId, _params) {
+          if (config.peers.length === 0) {
+            return {
+              content: [{ type: "text" as const, text: "No A2A peers configured." }],
+              details: { peers: [] },
+            };
+          }
+
+          const peerStates: Map<string, import("./src/types.js").PeerState> =
+            healthManager?.getAllStates() ?? new Map();
+
+          const lines = config.peers.map((p) => {
+            const state = peerStates.get(p.name);
+            const health = state?.health ?? "unknown";
+            const circuit = state?.circuit ?? "unknown";
+            const authType = p.auth ? p.auth.type : "none";
+            return (
+              `• ${p.name}\n` +
+              `  Endpoint: ${p.agentCardUrl}\n` +
+              `  Auth: ${authType}\n` +
+              `  Health: ${health} | Circuit: ${circuit}`
+            );
+          });
+
+          const text = `A2A Peers (${config.peers.length}):\n\n${lines.join("\n\n")}`;
+          return {
+            content: [{ type: "text" as const, text }],
+            details: { peers: config.peers.map((p) => ({ name: p.name, agentCardUrl: p.agentCardUrl })) },
+          };
+        },
+      });
+    }
+
     if (!api.registerService) {
       api.logger.warn("a2a-gateway: registerService is unavailable; HTTP endpoints are not started");
       return;
@@ -667,6 +926,9 @@ const plugin = {
         );
       },
       async stop(_ctx) {
+        // Stop federation
+        federationGateway?.stop();
+
         // Stop peer health checks
         healthManager?.stop();
         auditLogger.close();

@@ -106,6 +106,14 @@ export interface GatewayConfig {
     agentResponseTimeoutMs?: number;
   };
   resilience: PeerResilienceConfig;
+  federation?: {
+    enabled?: boolean;
+    gatewayId?: string;
+    peers?: Array<{ gatewayId: string; inboxUrl: string; hmacSecret: string }>;
+    limits?: { maxHops?: number; maxPayloadBytes?: number };
+    defaultAgentId?: string;
+    timestampSkewSeconds?: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
