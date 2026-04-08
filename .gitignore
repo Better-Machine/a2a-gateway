@@ -6,3 +6,4 @@ coverage/
 data/
 plan-*.md
 research-*.md
+*.local.json
