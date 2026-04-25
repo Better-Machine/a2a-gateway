@@ -2,6 +2,7 @@
  * Shared peer alias resolution for A2A CLI scripts.
  *
  * Reads ~/.openclaw/a2a-peers.json to resolve peer names to URLs and tokens.
+ * Falls back to ~/.openclaw/openclaw.json → plugins.a2a-gateway.config.peers[].
  *
  * Config format (~/.openclaw/a2a-peers.json):
  *   {
@@ -18,13 +19,39 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 const PEERS_FILE = join(homedir(), ".openclaw", "a2a-peers.json");
+const OPENCLAW_CONFIG = join(homedir(), ".openclaw", "openclaw.json");
+
+function loadOpenClawPeers() {
+  try {
+    const raw = readFileSync(OPENCLAW_CONFIG, "utf-8");
+    const config = JSON.parse(raw);
+    // A2A peers stored in plugins.entries["a2a-gateway"].config.peers
+    const pluginPeers = config?.plugins?.entries?.["a2a-gateway"]?.config?.peers;
+    if (!Array.isArray(pluginPeers)) return {};
+
+    // Convert array format to map format expected by resolvePeer
+    const peers = {};
+    for (const peer of pluginPeers) {
+      if (peer.name && peer.agentCardUrl) {
+        peers[peer.name] = {
+          url: peer.agentCardUrl.replace(/\/.well-known\/agent-card\.json$/, ""),
+          token: peer.auth?.type === "bearer" ? peer.auth.token : ""
+        };
+      }
+    }
+    return peers;
+  } catch {
+    return {};
+  }
+}
 
 export function loadPeers() {
   let raw;
   try {
     raw = readFileSync(PEERS_FILE, "utf-8");
   } catch {
-    return {};  // File doesn't exist — that's fine
+    // File doesn't exist — fall back to openclaw.json
+    return loadOpenClawPeers();
   }
   try {
     return JSON.parse(raw);

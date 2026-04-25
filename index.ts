@@ -608,6 +608,39 @@ const plugin = {
       res.json({ taskId, removed: existed });
     });
 
+    // --------------------------------------------------------
+    // /a2a/wake endpoint — agent wake protocol (RFC-0001)
+    // Returns readiness state for wake-before-send handshake
+    // --------------------------------------------------------
+    app.post(
+      "/a2a/wake",
+      createHttpMetricsMiddleware("wake"),
+      (req, res) => {
+        // Bearer auth check (same pattern as other endpoints)
+        if (config.security.inboundAuth === "bearer" && config.security.validTokens.size > 0) {
+          const authHeader = req.headers.authorization;
+          const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+          const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7) : "";
+          if (!token || !config.security.validTokens.has(token)) {
+            res.status(401).json({ error: "Unauthorized: invalid or missing bearer token" });
+            return;
+          }
+        }
+
+        // Parse optional body
+        const body = asObject(req.body);
+        const from = asString(body.from, "unknown");
+        const priority = asString(body.priority, "normal");
+
+        // Log wake request (audit trail)
+        api.logger.info(`a2a-gateway: wake request from=${from} priority=${priority}`);
+
+        // Return ready status
+        // TODO: In future (RFC-0002), check actual agent state and return "busy" if appropriate
+        res.json({ status: "ready" });
+      }
+    );
+
     let server: Server | null = null;
     let grpcServer: GrpcServer | null = null;
     let cleanupTimer: ReturnType<typeof setInterval> | null = null;
