@@ -1,6 +1,7 @@
 import type { AgentCard, AgentSkill } from "@a2a-js/sdk";
 
 import type { GatewayConfig } from "./types.js";
+import { buildBusySignalCapability } from "./busy-signal.js";
 
 function toSkill(entry: string | { id?: string; name: string; description?: string }, index: number): AgentSkill {
   if (typeof entry === "string") {
@@ -44,6 +45,20 @@ export function buildAgentCard(config: GatewayConfig): AgentCard {
     ? (configuredUrl ? new URL(configuredUrl).hostname : "localhost")
     : server.host;
 
+  // Build capabilities - use type assertion for busySignal since it's an extension
+  const capabilities: AgentCard["capabilities"] = {
+    streaming: true,
+    pushNotifications: false,
+    stateTransitionHistory: false,
+  };
+
+  // Add busySignal capability (extension to standard AgentCard)
+  (capabilities as any).busySignal = {
+    version: "0.2.0",
+    states: ["DORMANT", "READY", "BUSY", "UNREACHABLE"],
+    ttlDefaultMs: 30000,
+  };
+
   return {
     protocolVersion: "0.3.0",
     version: "1.0.0",
@@ -51,11 +66,7 @@ export function buildAgentCard(config: GatewayConfig): AgentCard {
     description: agentCard.description || "A2A bridge for OpenClaw agents",
     url: configuredUrl || fallbackUrl,
     skills: (agentCard.skills || []).map((entry, index) => toSkill(entry, index)),
-    capabilities: {
-      streaming: true,
-      pushNotifications: false,
-      stateTransitionHistory: false,
-    },
+    capabilities,
     securitySchemes,
     security,
     supportsAuthenticatedExtendedCard: false,

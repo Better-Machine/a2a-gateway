@@ -14,6 +14,7 @@ import type { MessageSendParams, Message } from "@a2a-js/sdk";
 
 import { ConnectionPool, type ConnectionPoolConfig } from "./connection-pool.js";
 import type { OutboundSendResult, PeerConfig, RetryConfig } from "./types.js";
+import type { PeerBusyState } from "./busy-signal.js";
 import type { PeerHealthManager } from "./peer-health.js";
 import { withRetry } from "./peer-retry.js";
 import {
@@ -464,6 +465,58 @@ export class A2AClient {
     } catch (error: unknown) {
       // Re-throw so the fallback loop can classify the error
       throw error;
+    }
+  }
+
+  /**
+   * Query a peer's busy state via a2a/busyState RPC.
+   * Returns null if the peer doesn't support busy signal or the request fails.
+   */
+  async queryBusyState(
+    peer: PeerConfig,
+    timeoutMs: number = 5000,
+  ): Promise<PeerBusyState | null> {
+    try {
+      const { baseUrl, path } = parseAgentCardUrl(peer.agentCardUrl);
+      const authFetch = this.createFetch(peer);
+
+      // Build JSON-RPC request for a2a/busyState
+      const rpcRequest = {
+        jsonrpc: "2.0" as const,
+        id: uuidv4(),
+        method: "a2a/busyState",
+        params: {},
+      };
+
+      const response = await authFetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rpcRequest),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const result = await response.json() as any;
+      if (!result.result) {
+        return null;
+      }
+
+      const r = result.result;
+      return {
+        state: r.state,
+        reportedAt: Date.now(),
+        ttlMs: r.ttlMs || 30000,
+        capacity: {
+          currentTasks: r.capacity?.currentTasks || 0,
+          maxTasks: r.capacity?.maxTasks || 3,
+        },
+        retryAfterMs: r.retryAfterMs,
+      };
+    } catch {
+      return null;
     }
   }
 

@@ -63,6 +63,15 @@ import {
   parseSaturationConfig,
   type SaturationConfig,
 } from "./src/saturation-model.js";
+import {
+  LocalBusyStateManager,
+  PeerBusyStateCache,
+  buildBusySignalCapability,
+  BUSY_ERROR_CODE,
+  DORMANT_ERROR_CODE,
+  buildBusyError,
+  getDefaultCapacity,
+} from "./src/busy-signal.js";
 
 /** Build a JSON-RPC error response. */
 function jsonRpcError(id: string | number | null, code: number, message: string) {
@@ -334,10 +343,21 @@ const plugin = {
     const executor = new QueueingAgentExecutor(
       agentExecutor,
       telemetry,
-      config.limits,
+      {
+        ...config.limits,
+        onTaskAcquired: () => localBusyState.acquireTask(),
+        onTaskReleased: () => localBusyState.releaseTask(),
+      },
       config.routing.defaultAgentId,
     );
     const agentCard = buildAgentCard(config);
+
+    // Busy Signal v0.2.0 initialization
+    const localBusyState = new LocalBusyStateManager({
+      maxTasks: config.limits.maxConcurrentTasks,
+      ttlDefaultMs: 30000,
+    });
+    const peerBusyCache = new PeerBusyStateCache();
 
     // Peer resilience: health check + circuit breaker
     const healthManager = config.peers.length > 0
@@ -507,6 +527,57 @@ const plugin = {
       })
     );
 
+    // Custom RPC endpoint: a2a/busyState
+    // Returns this gateway's current busy state and capacity
+    app.post(
+      "/a2a/busyState",
+      express.json(),
+      (_req, res) => {
+        const stateResponse = localBusyState.getState();
+        res.json({
+          jsonrpc: "2.0",
+          id: (_req.body as any)?.id ?? null,
+          result: stateResponse,
+        });
+      }
+    );
+
+    // Extended health endpoint (spec Section 6.2)
+    // GET /health?detailed=true returns component-level status
+    app.get("/health", (req, res) => {
+      const detailed = req.query.detailed === "true";
+      if (!detailed) {
+        res.json({ ok: true, status: "live" });
+        return;
+      }
+
+      const busyState = localBusyState.getState();
+      const peerStatuses: Record<string, string> = {};
+      if (healthManager) {
+        for (const [peerName, peerState] of healthManager.getAllStates()) {
+          peerStatuses[peerName] = peerState.health;
+        }
+      }
+
+      const meshHealthy = Object.keys(peerStatuses).length > 0
+        && Object.values(peerStatuses).every(s => s === "healthy");
+
+      res.json({
+        status: busyState.state === "BUSY" ? "degraded" : busyState.state === "DORMANT" ? "starting" : "ok",
+        components: {
+          a2a: "ok",
+          mesh: meshHealthy ? "ok" : "degraded",
+          peers: peerStatuses,
+          tasks: {
+            current: busyState.capacity.currentTasks,
+            max: busyState.capacity.maxTasks,
+            utilization: busyState.capacity.currentTasks / busyState.capacity.maxTasks,
+          },
+        },
+        since: busyState.state === "DORMANT" ? undefined : busyState.reportedAt,
+      });
+    });
+
     // Ensure errors return JSON-RPC style responses (avoid Express HTML error pages)
     app.use("/a2a/jsonrpc", (err: unknown, _req: unknown, res: any, next: (e?: unknown) => void) => {
       if (err instanceof SyntaxError) {
@@ -614,7 +685,7 @@ const plugin = {
     // --------------------------------------------------------
     app.post(
       "/a2a/wake",
-      createHttpMetricsMiddleware("wake"),
+      express.json(),
       (req, res) => {
         // Bearer auth check (same pattern as other endpoints)
         if (config.security.inboundAuth === "bearer" && config.security.validTokens.size > 0) {
@@ -644,6 +715,7 @@ const plugin = {
     let server: Server | null = null;
     let grpcServer: GrpcServer | null = null;
     let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+    let busyPollTimer: ReturnType<typeof setInterval> | null = null;
     const grpcPort = config.server.port + 1;
 
     api.registerGatewayMethod("a2a.metrics", ({ respond }) => {
@@ -748,6 +820,35 @@ const plugin = {
           ? `Peer not found: ${peerName}`
           : "No peer specified and no routing rule matched";
         respond(false, { error: hint });
+        return;
+      }
+
+      // Busy Signal check: verify peer is not BUSY before sending
+      const peerState = peerBusyCache.get(peer.name);
+      if (peerState === "BUSY") {
+        const retryAfterMs = peerBusyCache.getRetryAfterMs(peer.name) || 5000;
+        const startedAt = Date.now();
+        telemetry.recordOutboundRequest(peer.name, false, 503, Date.now() - startedAt);
+        auditLogger.recordOutbound(peer.name, false, 503, Date.now() - startedAt);
+        respond(false, {
+          statusCode: 503,
+          response: buildBusyError({
+            state: "BUSY",
+            retryAfterMs,
+            capacity: { currentTasks: 0, maxTasks: getDefaultCapacity(peer.name) },
+          }),
+        });
+        return;
+      }
+
+      if (peerState === "UNREACHABLE") {
+        const startedAt = Date.now();
+        telemetry.recordOutboundRequest(peer.name, false, 503, Date.now() - startedAt);
+        auditLogger.recordOutbound(peer.name, false, 503, Date.now() - startedAt);
+        respond(false, {
+          statusCode: 503,
+          response: { error: `Peer "${peer.name}" is unreachable (TTL expired)` },
+        });
         return;
       }
 
@@ -907,6 +1008,25 @@ const plugin = {
         // Start peer health checks
         healthManager?.start();
 
+        // Start busy-state polling for peers (refresh before TTL expires)
+        // Poll at half the TTL to ensure we always have fresh state
+        if (config.peers.length > 0) {
+          const pollIntervalMs = 15000; // 15 seconds (half of 30s TTL)
+          busyPollTimer = setInterval(async () => {
+            const effectivePeers = getEffectivePeers();
+            for (const peer of effectivePeers) {
+              try {
+                const busyState = await client.queryBusyState(peer, 3000);
+                if (busyState) {
+                  peerBusyCache.update(peer.name, busyState);
+                }
+              } catch (err) {
+                // Silently ignore - peer may not support busy signal yet
+              }
+            }
+          }, pollIntervalMs);
+        }
+
         // Start HTTP server (JSON-RPC + REST)
         await new Promise<void>((resolve, reject) => {
           server = app.listen(config.server.port, config.server.host, () => {
@@ -1001,6 +1121,12 @@ const plugin = {
         mdnsResponder?.start();
       },
       async stop(_ctx) {
+        // Stop busy-state polling
+        if (busyPollTimer) {
+          clearInterval(busyPollTimer);
+          busyPollTimer = null;
+        }
+
         // Stop mDNS self-advertisement (sends goodbye packet)
         mdnsResponder?.stop();
 

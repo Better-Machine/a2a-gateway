@@ -16,6 +16,9 @@ interface QueueingExecutorOptions {
   maxQueuedTasks: number;
   /** Bio-inspired Michaelis-Menten soft concurrency config. */
   saturation?: SaturationConfig;
+  /** Optional callback invoked when a task is acquired (+1) or released (-1). */
+  onTaskAcquired?: () => void;
+  onTaskReleased?: () => void;
 }
 
 interface QueuedTaskEntry {
@@ -216,6 +219,9 @@ export class QueueingAgentExecutor implements AgentExecutor {
       this.activeTasks,
       this.queue.length,
     );
+    
+    // Notify busy signal manager
+    this.options.onTaskAcquired?.();
 
     const observedBus = createObservedEventBus(entry.eventBus, (event) => {
       const status = event.kind === "task" || event.kind === "status-update" ? event.status : undefined;
@@ -250,6 +256,9 @@ export class QueueingAgentExecutor implements AgentExecutor {
     } finally {
       this.pendingByTaskId.delete(requestContext.taskId);
       this.activeTasks = Math.max(0, this.activeTasks - 1);
+
+      // Notify busy signal manager
+      this.options.onTaskReleased?.();
 
       this.telemetry.recordTaskFinish(
         requestContext.taskId,
