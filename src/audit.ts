@@ -22,13 +22,23 @@ export interface AuditEntry {
  * Append-only JSONL audit logger.
  * Writes one JSON line per A2A call event to a dedicated audit file,
  * separate from the application's structured logs.
+ *
+ * Includes lightweight per-peer failure tracking for self-healing alerts.
  */
 export class AuditLogger {
   private readonly filePath: string;
   private dirEnsured = false;
 
-  constructor(filePath: string) {
+  /** In-memory failure counter per peer. Key: peer name. */
+  private peerFailures: Map<string, { consecutive: number; lastError: string; lastAt: number }> = new Map();
+  /** Threshold for CRITICAL alert on consecutive failures. */
+  private alertThreshold = 3;
+
+  constructor(filePath: string, alertThreshold?: number) {
     this.filePath = filePath;
+    if (alertThreshold !== undefined && alertThreshold > 0) {
+      this.alertThreshold = alertThreshold;
+    }
   }
 
   private ensureDir(): void {
@@ -42,6 +52,7 @@ export class AuditLogger {
     contextId: string,
     status: string,
     durationMs: number,
+    peer?: string,
   ): void {
     this.write({
       ts: new Date().toISOString(),
@@ -49,9 +60,14 @@ export class AuditLogger {
       type: "task",
       taskId,
       contextId,
+      peer,
       status,
       durationMs,
     });
+    // Track per-peer failures for inbound
+    if (peer && status === "failed") {
+      this.trackPeerFailure(peer, `inbound task ${taskId} failed`);
+    }
   }
 
   recordOutbound(
@@ -69,6 +85,11 @@ export class AuditLogger {
       statusCode,
       durationMs,
     });
+    if (!ok) {
+      this.trackPeerFailure(peer, `outbound ${statusCode || "no status"}`);
+    } else {
+      this.resetPeerFailure(peer);
+    }
   }
 
   recordSecurityEvent(surface: string, reason: string): void {
@@ -107,6 +128,43 @@ export class AuditLogger {
 
   close(): void {
     // No-op — appendFileSync has no persistent handles to close
+  }
+
+  /**
+   * Track a failure for a peer. If consecutive failures exceed threshold,
+   * emit a CRITICAL alert and return true.
+   */
+  private trackPeerFailure(peer: string, error: string): boolean {
+    const existing = this.peerFailures.get(peer);
+    if (existing) {
+      existing.consecutive++;
+      existing.lastError = error;
+      existing.lastAt = Date.now();
+    } else {
+      this.peerFailures.set(peer, { consecutive: 1, lastError: error, lastAt: Date.now() });
+    }
+    const current = this.peerFailures.get(peer)!;
+    if (current.consecutive >= this.alertThreshold) {
+      this.write({
+        ts: new Date().toISOString(),
+        direction: "inbound",
+        type: "security",
+        status: "CRITICAL",
+        detail: `Peer ${peer}: ${current.consecutive} consecutive failures — ${error}. Consider clearing session cache.`,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /** Reset failure counter for a peer after a successful message. */
+  private resetPeerFailure(peer: string): void {
+    this.peerFailures.delete(peer);
+  }
+
+  /** Get current failure state for a peer. */
+  getPeerFailureState(peer: string): { consecutive: number; lastError: string; lastAt: number } | null {
+    return this.peerFailures.get(peer) || null;
   }
 
   private write(entry: AuditEntry): void {

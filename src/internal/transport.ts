@@ -152,8 +152,14 @@ export class InboundServer {
     try {
       const result = await this.handlers.onMessage(envelope, rawBody, headers);
       this.sendJson(res, result.statusCode, JSON.parse(result.body));
-    } catch {
-      this.sendJson(res, 500, { error: "Internal server error" });
+    } catch (err) {
+      const detail = process.env.NODE_ENV !== "production"
+        ? {
+            error: err instanceof Error ? err.message : "Internal server error",
+            stack: err instanceof Error ? err.stack : undefined,
+          }
+        : { error: "Internal server error" };
+      this.sendJson(res, 500, detail);
     }
   }
 

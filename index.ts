@@ -329,6 +329,7 @@ const plugin = {
   id: "a2a-gateway",
   name: "A2A Gateway",
   description: "OpenClaw plugin that serves A2A v0.3.0 endpoints",
+  configSchema: {},
 
   register(api: OpenClawPluginApi) {
     const config = parseConfig(api.pluginConfig, api.resolvePath?.bind(api));
