@@ -33,8 +33,14 @@ function loadOpenClawPeers() {
     const peers = {};
     for (const peer of pluginPeers) {
       if (peer.name && peer.agentCardUrl) {
+        // Strip the well-known agent card path so the URL points at the gateway root.
+        // Handles both A2A v0.2 (/.well-known/agent-card.json with hyphen) and
+        // A2A v0.3 (/.well-known/agent.json without hyphen).
+        const baseUrl = peer.agentCardUrl
+          .replace(/\/\.well-known\/agent-card\.json$/, "")
+          .replace(/\/\.well-known\/agent\.json$/, "");
         peers[peer.name] = {
-          url: peer.agentCardUrl.replace(/\/.well-known\/agent-card\.json$/, ""),
+          url: baseUrl,
           token: peer.auth?.type === "bearer" ? peer.auth.token : ""
         };
       }
